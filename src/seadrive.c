@@ -376,7 +376,7 @@ load_config_from_file (const char *config_file)
 static int
 write_pidfile (char *pidfile)
 {
-    int fd = open (pidfile, O_WRONLY | O_CREAT, 0644);
+    int fd = open (pidfile, O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
         seaf_warning ("Failed to open pidfile %s: %s\n",
                       pidfile, strerror(errno));
@@ -384,12 +384,49 @@ write_pidfile (char *pidfile)
     }
 
     if (flock (fd, LOCK_EX | LOCK_NB) < 0) {
+        /* Lock failed. Check if the holder is still alive. */
+        int stale = 0;
+        char buf[32] = {0};
+        ssize_t n = read (fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            pid_t old_pid = (pid_t) atol (buf);
+            if (old_pid > 0 && kill (old_pid, 0) < 0 && errno == ESRCH) {
+                seaf_message ("Removing stale pidfile (pid %d no longer running).\n",
+                              (int) old_pid);
+                stale = 1;
+            }
+        } else {
+            /* Empty pidfile with a held lock — legacy or corrupted.
+             * Assume stale since a healthy process would still be writing. */
+            seaf_message ("Removing stale pidfile (empty, likely from a crash).\n");
+            stale = 1;
+        }
+
+        if (stale) {
+            close (fd);
+            unlink (pidfile);
+            fd = open (pidfile, O_RDWR | O_CREAT, 0644);
+            if (fd < 0 || flock (fd, LOCK_EX | LOCK_NB) < 0) {
+                seaf_warning ("Failed to reacquire pidfile %s: %s\n",
+                              pidfile, strerror(errno));
+                if (fd >= 0) close (fd);
+                return -1;
+            }
+            goto locked;
+        }
+
         seaf_warning ("Failed to lock pidfile %s: %s\n",
                       pidfile, strerror(errno));
         close (fd);
         return -1;
     }
 
+locked:
+    ftruncate (fd, 0);
+    lseek (fd, 0, SEEK_SET);
+    dprintf (fd, "%d\n", (int) getpid ());
+
+    /* Keep fd open so the lock is held for the lifetime of the process. */
     return 0;
 }
 
